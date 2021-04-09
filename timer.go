@@ -1,3 +1,25 @@
+// MIT License
+//
+// Copyright (c) 2021 ydd
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package timer
 
 import (
@@ -7,24 +29,26 @@ import (
 )
 
 type Timer interface {
-	// 重置到期时间
-	// 已执行或未执行都会重置 timer 的到期时间。重复定时器会一同改变周期
-	// 当且仅当 定时器已经停止，返回 false。
+	// Reset changes the timer to expire after duration d.
+	// It returns true if the timer had been active or had executed,
+	// false if the timer been stopped.
 	Reset(duration time.Duration) bool
 
-	// 停止定时器
+	// Stop prevents the Timer from firing.
+	// It returns true if the call stops the timer, false if the timer has already
+	// been stopped.
 	Stop() bool
 }
 
 type runtimeTimer struct {
-	when     int64 // 到期时间
-	ctx      interface{}
-	fn       func(ctx interface{})
-	repeated bool
-	period   int64 // 周期
+	expire   time.Time     // expire time
+	fn       func()        // a function will be executed when expired
+	repeated bool          // repeat task
+	period   time.Duration // period of timer, it active if repeated is true
+	stopped  int32         // timer is stopped
 }
 
-func goFunc(fn func(ctx interface{}), ctx interface{}) {
+func goFunc(fn func()) {
 	go func() {
 		defer func() {
 			err := dutil.Recover()
@@ -32,7 +56,7 @@ func goFunc(fn func(ctx interface{}), ctx interface{}) {
 				log.Printf("timer: goFunc Recover %s", err)
 			}
 		}()
-		fn(ctx)
+		fn()
 	}()
 }
 
@@ -43,25 +67,23 @@ func sendSignal(ch chan struct{}) {
 	}
 }
 
-// when is a helper function for setting the 'when' field of a runtimeTimer.
-// It returns what the time will be, in nanoseconds, Duration d in the future.
-// If d is negative, it is ignored. If the returned value would be less than
-// zero because of an overflow, MaxInt64 is returned.
-func when(d time.Duration) int64 {
+// when is a helper function for setting the 'expire' field of a runtimeTimer.
+// It returns what the time will be, in time.Time, Duration d in the future.
+func when(d time.Duration) time.Time {
 	if d <= 0 {
-		return time.Now().UnixNano()
+		return time.Now()
 	}
-	t := time.Now().UnixNano() + int64(d)
-	if t < 0 {
-		t = 1<<63 - 1 // math.MaxInt64
-	}
-	return t
+	return time.Now().Add(d)
 }
 
+// TimerMgr interface
 type TimerMgr interface {
-	// 一次性定时器
-	OnceTimer(d time.Duration, ctx interface{}, f func(ctx interface{})) Timer
+	// OnceTimer waits for the duration to elapse and then calls f
+	// in its own goroutine. It returns a Timer. It's done once
+	OnceTimer(d time.Duration, f func()) Timer
 
-	// 重复定时器
-	RepeatTimer(d time.Duration, ctx interface{}, f func(ctx interface{})) Timer
+	// RepeatTimer waits for the duration to elapse and then calls f
+	// in its own goroutine. It returns a Timer. It can be used to
+	// cancel the call using its Stop method.
+	RepeatTimer(d time.Duration, f func()) Timer
 }

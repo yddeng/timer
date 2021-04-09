@@ -1,3 +1,25 @@
+// MIT License
+//
+// Copyright (c) 2021 ydd
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package timer
 
 import (
@@ -6,78 +28,76 @@ import (
 	"time"
 )
 
-/*
- 低精度 timer, 最低精度为毫秒
- 如果时间轮精度为10ms， 那么他的误差在 （0，10）ms之间。如果一个任务延迟 500ms，那它的执行时间在490～500ms之间。
- 按平均来讲，出错的概率均等的情况下，那么这个出错可能会延迟或提前最小刻度的一半，在这里就是10ms/2=5ms.
- 故，时间轮的 tick 单位 在总延迟时间上，应该不足以影响延迟执行函数处理的事务。
-*/
-
 const (
 	defaultBucketNum = 10
 	defaultInterval  = time.Millisecond
 )
 
 type WheelTimer struct {
-	key     int64
-	circle  int // 需要转动多少圈
-	rt      *runtimeTimer
-	mgr     *TimeWheelMgr
-	stopped int32
+	key    int64
+	circle int // 需要转动多少圈
+	rt     *runtimeTimer
+	mgr    *TimeWheelMgr
 }
 
-func newWheelTimer(d time.Duration, repeated bool, ctx interface{}, f func(ctx interface{})) *WheelTimer {
+func newWheelTimer(d time.Duration, repeated bool, f func()) *WheelTimer {
 	return &WheelTimer{
 		key: 0,
 		rt: &runtimeTimer{
-			when:     when(d),
-			ctx:      ctx,
+			expire:   when(d),
 			fn:       f,
 			repeated: repeated,
-			period:   int64(d),
+			period:   d,
 		},
-		mgr:     nil,
-		stopped: 0,
+		mgr: nil,
 	}
 }
 
+// Reset changes the timer to expire after duration d.
+// It returns true if the timer had been active or had executed,
+// false if the timer been stopped.
 func (t *WheelTimer) Reset(d time.Duration) bool {
 	if t.mgr == nil {
 		panic("timer: Reset called on uninitialized WheelTimer")
 	}
 
-	if atomic.LoadInt32(&t.stopped) == 1 {
+	if atomic.LoadInt32(&t.rt.stopped) == 1 {
 		return false
 	}
 
 	t.mgr.removeTimer(t)
-	t.rt.when = when(d)
-	t.rt.period = int64(d)
+	t.rt.expire = when(d)
+	t.rt.period = d
 	t.mgr.addTimer(t)
 	return true
 }
 
+// Stop prevents the Timer from firing.
+// It returns true if the call stops the timer, false if the timer has already
+// been stopped.
 func (t *WheelTimer) Stop() bool {
 	if t.mgr == nil {
 		panic("timer: Stop called on uninitialized WheelTimer")
 	}
-	atomic.StoreInt32(&t.stopped, 1)
+	atomic.StoreInt32(&t.rt.stopped, 1)
 	t.mgr.removeTimer(t)
 	return true
 }
 
+// do calls f in its own goroutine. it return expire it is stopped.
+// addTimer expire t.repeated is true.
 func (t *WheelTimer) do() {
-	if atomic.LoadInt32(&t.stopped) == 1 {
+	if atomic.LoadInt32(&t.rt.stopped) == 1 {
 		return
 	}
 
-	goFunc(t.rt.fn, t.rt.ctx)
+	goFunc(t.rt.fn)
 	//repeat
 	if t.rt.repeated {
-		if atomic.LoadInt32(&t.stopped) == 1 {
+		if atomic.LoadInt32(&t.rt.stopped) == 1 {
 			return
 		}
-		t.rt.when = when(time.Duration(t.rt.period))
+		t.rt.expire = when(t.rt.period)
 		t.mgr.addTimer(t)
 	}
 }
@@ -86,9 +106,10 @@ type TimeWheelMgr struct {
 	interval     time.Duration
 	bucketNum    int
 	buckets      []*bucket
-	timer2bucket map[int64]int // 定时器所在的槽, 主要用于删除定时器
-	accumulator  int64         // 计数器
-	currentIdx   int           // 当前游标
+	timer2bucket map[int64]int // mark timeWheel slot index,
+	accumulator  int64         // accumulator for timer.key
+	currentIdx   int           // index of the current buckets
+	started      int32
 	mtx          sync.Mutex
 }
 
@@ -96,6 +117,7 @@ type bucket struct {
 	timers map[int64]*WheelTimer
 }
 
+// NewTimeWheelMgr
 func NewTimeWheelMgr(interval time.Duration, bucketNum int) *TimeWheelMgr {
 	if bucketNum < defaultBucketNum {
 		bucketNum = defaultBucketNum
@@ -117,10 +139,10 @@ func NewTimeWheelMgr(interval time.Duration, bucketNum int) *TimeWheelMgr {
 		mgr.buckets[i] = &bucket{timers: map[int64]*WheelTimer{}}
 	}
 
-	go mgr.run()
 	return mgr
 }
 
+// addTimer add timer to manager
 func (mgr *TimeWheelMgr) addTimer(t *WheelTimer) {
 	if t.key == 0 {
 		key := atomic.AddInt64(&mgr.accumulator, 1)
@@ -128,16 +150,16 @@ func (mgr *TimeWheelMgr) addTimer(t *WheelTimer) {
 		t.mgr = mgr
 	}
 
-	// 如果过期时间小于单位的一半直接完成
-	delay := t.rt.when - time.Now().UnixNano()
-	if delay < int64(mgr.interval) {
+	delay := t.rt.expire.Sub(time.Now())
+	if delay < mgr.interval {
+		// execute directly if the expiration time is less than the manager.interval
 		t.do()
 	} else {
 		mgr.mtx.Lock()
 		defer mgr.mtx.Unlock()
 
-		circle := int(delay / int64(mgr.interval) / int64(mgr.bucketNum))
-		idx := (mgr.currentIdx + int(delay/int64(mgr.interval))) % mgr.bucketNum
+		circle := int(int64(delay) / int64(mgr.interval) / int64(mgr.bucketNum))
+		idx := (mgr.currentIdx + int(int64(delay)/int64(mgr.interval))) % mgr.bucketNum
 		t.circle = circle
 
 		mgr.timer2bucket[t.key] = idx
@@ -145,6 +167,7 @@ func (mgr *TimeWheelMgr) addTimer(t *WheelTimer) {
 	}
 }
 
+// removeTimer remove timer from manager
 func (mgr *TimeWheelMgr) removeTimer(t *WheelTimer) {
 	mgr.mtx.Lock()
 	defer mgr.mtx.Unlock()
@@ -175,14 +198,25 @@ func (mgr *TimeWheelMgr) run() {
 	}
 }
 
-func (mgr *TimeWheelMgr) OnceTimer(d time.Duration, ctx interface{}, f func(ctx interface{})) Timer {
-	t := newWheelTimer(d, false, ctx, f)
+// registerTimer add timer to manager and run the manager first time
+func (mgr *TimeWheelMgr) registerTimer(d time.Duration, repeated bool, f func()) *WheelTimer {
+	if atomic.CompareAndSwapInt32(&mgr.started, 0, 1) {
+		go mgr.run()
+	}
+	t := newWheelTimer(d, repeated, f)
 	mgr.addTimer(t)
 	return t
 }
 
-func (mgr *TimeWheelMgr) RepeatTimer(d time.Duration, ctx interface{}, f func(ctx interface{})) Timer {
-	t := newWheelTimer(d, true, ctx, f)
-	mgr.addTimer(t)
-	return t
+// OnceTimer waits for the duration to elapse and then calls f
+// in its own goroutine. It returns a Timer. It's done once
+func (mgr *TimeWheelMgr) OnceTimer(d time.Duration, f func()) Timer {
+	return mgr.registerTimer(d, false, f)
+}
+
+// RepeatTimer waits for the duration to elapse and then calls f
+// in its own goroutine. It returns a Timer. It can be used to
+// cancel the call using its Stop method.
+func (mgr *TimeWheelMgr) RepeatTimer(d time.Duration, f func()) Timer {
+	return mgr.registerTimer(d, true, f)
 }
