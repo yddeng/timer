@@ -79,9 +79,11 @@ func (t *WheelTimer) Stop() bool {
 	if t.mgr == nil {
 		panic("timer: Stop called on uninitialized WheelTimer")
 	}
-	atomic.StoreInt32(&t.rt.stopped, 1)
-	t.mgr.removeTimer(t)
-	return true
+	if atomic.CompareAndSwapInt32(&t.rt.stopped, 0, 1) {
+		t.mgr.removeTimer(t)
+		return true
+	}
+	return false
 }
 
 // do calls f in its own goroutine. it return expire it is stopped.
