@@ -31,8 +31,8 @@ import (
 
 // HeapTimer
 type HeapTimer struct {
-	rt  *runtimeTimer
 	key int64
+	rt  *runtimeTimer
 	mgr *HeapTimerMgr
 }
 
@@ -50,7 +50,7 @@ func newHeapTimer(d time.Duration, repeated bool, f func()) *HeapTimer {
 }
 
 // Less is used to compare expiration with other Timer.
-func (t *HeapTimer) Less(elem heap.Element) bool {
+func (t *HeapTimer) Less(elem interface{}) bool {
 	return t.rt.expire.Before(elem.(*HeapTimer).rt.expire)
 }
 
