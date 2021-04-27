@@ -154,6 +154,7 @@ func (mgr *HeapTimerMgr) run() {
 	var tt *time.Timer
 	var min heap.Element
 	for {
+		// 每添加一个 timer 都会触发循环，重新计算最小值
 		<-mgr.signalChan
 		now := time.Now()
 		for {
