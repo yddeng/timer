@@ -23,7 +23,7 @@
 package timer
 
 import (
-	"github.com/yddeng/heap"
+	"github.com/yddeng/utils/heap"
 	"sync"
 	"sync/atomic"
 	"time"

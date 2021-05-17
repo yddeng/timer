@@ -23,8 +23,9 @@
 package timer
 
 import (
-	"github.com/yddeng/dutil"
+	"fmt"
 	"log"
+	"runtime"
 	"time"
 )
 
@@ -51,9 +52,10 @@ type runtimeTimer struct {
 func goFunc(fn func()) {
 	go func() {
 		defer func() {
-			err := dutil.Recover()
-			if err != nil {
-				log.Printf("timer: goFunc Recover %s", err)
+			if r := recover(); r != nil {
+				buf := make([]byte, 2048)
+				l := runtime.Stack(buf, false)
+				log.Printf(fmt.Sprintf("%v: %s", r, buf[:l]))
 			}
 		}()
 		fn()
